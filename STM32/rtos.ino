@@ -15,16 +15,19 @@ typedef struct task {
 } task;
 
 //periods
-const unsigned long period = 5; 
-const unsigned long periodSampleINA = 5;
-const unsigned long periodRelayCtrl = 10;
+const unsigned long period = 1; 
+const unsigned long periodUartTX = 500;
+const unsigned long periodSampleINA = 1;
+const unsigned long periodRelayCtrl = 1;
 
+enum UartTX_states{UartTX_INIT, UartTX_SEND_AVG};
+int UartTX(int);
 enum SampleINA_states{INA219_INIT, INA219_SAMPLE, INA219_SEND_AVG, INA219_ERROR};
 int SampleINA(int);
 enum RelayCtrl_states{RelayCtrl_INIT, RelayCtrl_CTRL};
 int RelayCtrl(int);
 
-const unsigned int numTasks = 2;
+const unsigned int numTasks = 3;
 task tasks[numTasks];
 
 void TimerISR() {
@@ -73,6 +76,29 @@ HardwareTimer *Timer = new HardwareTimer(TIM2);
 
 //------------------------Tasks------------------------
 
+int UartTX(int state) {
+  switch(state) {
+    case UartTX_INIT:
+      ESP_SERIAL.begin(ESP_BAUD);
+      ESP_SERIAL.println("[STM] UART Started");
+      state = UartTX_SEND_AVG;
+      break;
+    case UartTX_SEND_AVG:
+      if (SAMPLE_DONE){
+        ESP_SERIAL.println("[STM] Sending pwr avgs");
+        ESP_SERIAL.print("T=");
+        ESP_SERIAL.print(millis());
+        ESP_SERIAL.print(",S1_P=");
+        ESP_SERIAL.print(S1_PWR_AVG, 3);
+        ESP_SERIAL.print(",S2_P=");
+        ESP_SERIAL.println(S2_PWR_AVG, 3);
+        SAMPLE_DONE = false;
+      }
+      break;
+  }
+  return state;
+}
+
 int SampleINA(int state) {
   float S1_mA, S1_V, S2_mA, S2_V;
   static float S1_mA_TOT, S1_V_TOT, S2_mA_TOT, S2_V_TOT;
@@ -91,22 +117,18 @@ int SampleINA(int state) {
       samples = 0;
       SAMPLE_DONE = false;
       Wire.begin();
-      ESP_SERIAL.begin(ESP_BAUD);
+      Wire.setTimeout(3);
 
       //setup ina219 i2c addresses are 0x0040 and 0x0041, one ina has bridged A0 solder pads
       //also print through the esp UART connection since were using stm vlink and not a serial programmer
       if (!ina219_1.begin()) {
         state = INA219_ERROR;
         break;
-      } else {
-        ESP_SERIAL.println("[STM] INA_1 begun");
       }
 
       if (!ina219_2.begin()) {
         state = INA219_ERROR;
         break;
-      } else {
-        ESP_SERIAL.println("[STM] INA_2 begun");
       }
 
       state = INA219_SAMPLE;
@@ -124,7 +146,7 @@ int SampleINA(int state) {
       S2_V_TOT += S2_V;
 
       samples++;
-      if (samples >= 10) {
+      if (samples >= 50) {
         //calculate averages
         S1_mA_AVG = S1_mA_TOT / samples;
         S1_V_AVG = S1_V_TOT / samples;
@@ -148,19 +170,13 @@ int SampleINA(int state) {
       break;
 
     case INA219_SEND_AVG:
-        ESP_SERIAL.print("T=");
-        ESP_SERIAL.print(millis());
-        ESP_SERIAL.print(",S1_P=");
-        ESP_SERIAL.print(S1_PWR_AVG, 3);
-        ESP_SERIAL.print(",S2_P=");
-        ESP_SERIAL.println(S2_PWR_AVG, 3);
-        SAMPLE_DONE = false;
-        state = INA219_SAMPLE;
+        if (!SAMPLE_DONE){
+          state = INA219_INIT;
+        }
         break;
 
     case INA219_ERROR:
       ESP_SERIAL.println("[STM] ERROR INITIALIZING INAs, RETRYING");
-      delay(5000);
       state = INA219_INIT;
       break;
   }
@@ -175,6 +191,10 @@ int RelayCtrl(int state) {
     //ESP_SERIAL.println((int)c);
     if (c == '\n' || c == '\r') {//parse buffer on new line
       if (rxLen > 0) {
+        if (rxLen >= sizeof(rxBuf)){
+          rxLen = sizeof(rxBuf) - 1;
+        }
+        rxBuf[rxLen] = '\0';
         ESP_SERIAL.print("[STM] ");
         ESP_SERIAL.println(rxBuf);
 
@@ -197,7 +217,7 @@ int RelayCtrl(int state) {
       }
       rxLen = 0;
     } else {
-      if (rxLen < 63) {
+      if (rxLen < sizeof(rxBuf) - 1) {
         rxBuf[rxLen++] = c;
       }
     }
@@ -214,10 +234,10 @@ int RelayCtrl(int state) {
       break;
 
     case RelayCtrl_CTRL:
-      if (S1_PWR_AVG >= thresh1 && thresh1 > 0.0f) {
+      if ((S1_PWR_AVG * 1000) >= thresh1 && thresh1 > 0) {
         r1 = false;
       }
-      if (S2_PWR_AVG >= thresh2 && thresh2 > 0.0f) {
+      if ((S2_PWR_AVG * 1000) >= thresh2 && thresh2 > 0) {
         r2 = false;
       }
       digitalWrite(R1_PIN, r1 ? LOW : HIGH);
@@ -232,15 +252,20 @@ void setup() {
   Serial.begin(115200);
 
   //setup tasks
-  tasks[0].state = INA219_INIT;
-  tasks[0].period = periodSampleINA;
+  tasks[0].state = UartTX_INIT;
+  tasks[0].period = periodUartTX;
   tasks[0].elapsedTime = tasks[0].period;
-  tasks[0].Function = &SampleINA;
+  tasks[0].Function = &UartTX;
 
-  tasks[1].state = 0;
-  tasks[1].period = periodRelayCtrl;
+  tasks[1].state = INA219_INIT;
+  tasks[1].period = periodSampleINA;
   tasks[1].elapsedTime = tasks[1].period;
-  tasks[1].Function = &RelayCtrl;
+  tasks[1].Function = &SampleINA;
+
+  tasks[2].state = RelayCtrl_INIT;
+  tasks[2].period = periodRelayCtrl;
+  tasks[2].elapsedTime = tasks[2].period;
+  tasks[2].Function = &RelayCtrl;
 
   //setup timer ISR
   Timer->setOverflow(period * 1000, MICROSEC_FORMAT); 
