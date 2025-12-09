@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 / STM32 Power Monitor</title>
+
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background:#111;
+    color:#eee;
+    padding:16px;
+  }
+  .row {
+    display:flex;
+    gap:12px;
+    flex-wrap:wrap;
+    align-items:flex-start;
+    margin-bottom:12px;
+  }
+  button, input[type=number] {
+    padding:10px 14px;
+    border-radius:10px;
+    border:1px solid #333;
+    background:#222;
+    color:#eee;
+  }
+  button:hover {
+    background:#2a2a2a;
+    cursor:pointer;
+  }
+  .card {
+    background:#181818;
+    border-radius:14px;
+    padding:16px;
+    box-shadow: 0 0 24px rgba(0,0,0,0.2);
+    width:100%;
+  }
+  .kpi {
+    font-size:14px;
+    opacity:0.8;
+  }
+  .kpi strong {
+    font-size:18px;
+  }
+  h2, h3 {
+    margin-top:0;
+  }
+  .chart-container {
+    position:relative;
+    width:100%;
+    height:260px;
+  }
+</style>
+</head>
+
+<body>
+<h2>ESP32 / STM32 Power Monitor</h2>
+
+<div class="kpi" id="powr">Latest: S1=0 W, S2=0 W</div>
+<br>
+
+<div class="row">
+  <div class="card">
+    <h3>Relay 1 Power</h3>
+    <div class="chart-container">
+      <canvas id="powerChart1"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="card">
+    <h3>Relay 1 Control</h3>
+    <button onclick="relayOneOn()">Relay 1 ON</button>
+    <button onclick="relayOneOff()">Relay 1 OFF</button>
+    <br><br>
+    <span class="kpi">Threshold (mW):</span>
+    <input id="threshOne" type="number" placeholder="2500" />
+    <button onclick="setOneThresh()">Set Threshold</button>
+  </div>
+</div>
+
+<div class="row">
+  <div class="card">
+    <h3>Relay 2 Power</h3>
+    <div class="chart-container">
+      <canvas id="powerChart2"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="card">
+    <h3>Relay 2 Control</h3>
+    <button onclick="relayTwoOn()">Relay 2 ON</button>
+    <button onclick="relayTwoOff()">Relay 2 OFF</button>
+    <br><br>
+    <span class="kpi">Threshold (mW):</span>
+    <input id="threshTwo" type="number" placeholder="2500" />
+    <button onclick="setTwoThresh()">Set Threshold</button>
+  </div>
+</div>
+
+<!-- Use local chart.js stored in LittleFS -->
+<script src="/chart.js"></script>
+
+<script>
+// ------------------ Relay / Threshold Controls ------------------
+
+function relayOneOn(){ fetch('/relayone/on',  { method:'POST' }); }
+function relayOneOff(){ fetch('/relayone/off',{ method:'POST' }); }
+
+function relayTwoOn(){ fetch('/relaytwo/on',  { method:'POST' }); }
+function relayTwoOff(){ fetch('/relaytwo/off',{ method:'POST' }); }
+
+function setOneThresh() {
+  let v = document.getElementById('threshOne').value || '2500';
+  fetch('/threshone?mW=' + encodeURIComponent(v), { method:'POST' });
+}
+
+function setTwoThresh() {
+  let v = document.getElementById('threshTwo').value || '2500';
+  fetch('/threshtwo?mW=' + encodeURIComponent(v), { method:'POST' });
+}
+
+// ------------------ Chart.js setup ------------------
+
+let powerChart1 = null;
+let powerChart2 = null;
+
+function createChart(ctx, labelText) {
+  return new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [{
+        label: labelText,
+        data: [],
+        borderColor: 'rgba(255,255,255,0.8)',
+        backgroundColor: 'rgba(255,255,255,0.15)',
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.15
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          ticks: { color:'#aaa', maxRotation:0, autoSkip:true },
+          grid:  { color:'#333' },
+          title: {
+            display: true,
+            text: 'Time (last 15 min)',
+            color: '#ddd'
+          }
+        },
+        y: {
+          ticks: { color:'#aaa' },
+          grid:  { color:'#333' },
+          title: {
+            display: true,
+            text: 'Power (W)',
+            color: '#ddd'
+          }
+        }
+      },
+      plugins: {
+        legend: { labels: { color:'#eee' } }
+      }
+    }
+  });
+}
+
+function setupCharts() {
+  const ctx1 = document.getElementById('powerChart1').getContext('2d');
+  const ctx2 = document.getElementById('powerChart2').getContext('2d');
+
+  powerChart1 = createChart(ctx1, 'INA219_1 Power (W)');
+  powerChart2 = createChart(ctx2, 'INA219_2 Power (W)');
+}
+
+// data: { t:[epoch...], s1:[...], s2:[...] }  (s1/s2 are in W)
+function updateChartsWithData(data) {
+  if (!powerChart1 || !powerChart2) return;
+  if (!Array.isArray(data.t) || !Array.isArray(data.s1) || !Array.isArray(data.s2)) return;
+
+  const len = Math.min(data.t.length, data.s1.length, data.s2.length);
+  if (!len) return;
+
+  const labels = [];
+  const v1 = [];
+  const v2 = [];
+
+  for (let i = 0; i < len; i++) {
+    const epoch = parseInt(data.t[i], 10);
+    const d = new Date(epoch * 1000);
+    labels.push(
+      d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' })
+    );
+    v1.push(Number(data.s1[i]));
+    v2.push(Number(data.s2[i]));
+  }
+
+  powerChart1.data.labels = labels;
+  powerChart1.data.datasets[0].data = v1;
+  powerChart2.data.labels = labels;
+  powerChart2.data.datasets[0].data = v2;
+
+  powerChart1.update('none');
+  powerChart2.update('none');
+
+  const latest1 = v1[len - 1];
+  const latest2 = v2[len - 1];
+  document.getElementById('powr').innerText =
+    'Latest: S1=' + latest1.toFixed(3) + ' W, S2=' + latest2.toFixed(3) + ' W';
+}
+
+function loadLiveData() {
+  fetch('/api/live')
+    .then(r => r.json())
+    .then(data => {
+      updateChartsWithData(data);
+    })
+    .catch(err => {
+      console.error('Error fetching live data:', err);
+    });
+}
+
+window.onload = () => {
+  setupCharts();
+  loadLiveData();
+  // poll every 5 seconds; ESP keeps a 15-minute window in RAM
+  setInterval(loadLiveData, 5000);
+};
+</script>
+
+</body>
+</html>
